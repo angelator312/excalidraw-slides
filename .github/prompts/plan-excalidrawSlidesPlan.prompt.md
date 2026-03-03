@@ -1,5 +1,5 @@
 Plan: model‑mapped task list
-
+TL;DR — Implement an optional Preact presentation plugin + Node service (MongoDB + socket.io) that adds multi-presentation storage, team-based ACLs, owner one‑time auth links, realtime cursors/diffs, bounded auto-history (N=50) + named snapshots, thumbnails (separate files), and client export (PNG + notes). Split the work into clear implementation steps and assign each step to an appropriate AI model tier (mini → low-cost for routine code, medium → design/complex flows, large → architecture/CRDT/security). This lets you run inexpensive agents for most work while reserving stronger models for hard problems.
 GPT 5 mini
 1. Scaffold client + server: `package.json`, `vite.config.ts`, `src/entry.tsx`, `server/src/index.ts`, basic NPM scripts.
 2. Create UI skeletons: `src/presentation/plugin.tsx`, `ToolbarButton.tsx`, `PresenterView.tsx` shells with ARIA.

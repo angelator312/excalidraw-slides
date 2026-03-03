@@ -3,51 +3,86 @@ import http from 'http'
 import { Server as IOServer } from 'socket.io'
 import { MongoClient } from 'mongodb'
 import bodyParser from 'body-parser'
+
 import { storeThumbnail, getThumbnailStream } from './storage/thumbnail'
+import { makeAuthRouter } from './api/auth'
+import { makeTeamsRouter } from './api/teams'
+import { makePresentationsRouter } from './api/presentations'
+import { attachWs } from './ws'
+import { schedulePruneVersions } from './jobs/pruneVersions'
+import {
+  ensureUserIndexes,
+} from './models/user'
+import { ensureTeamIndexes } from './models/team'
+import { ensurePresentationIndexes } from './models/presentation'
+import { ensureSlideIndexes } from './models/slide'
+import { ensureVersionIndexes } from './models/version'
+import { ensureSnapshotIndexes } from './models/snapshot'
+import { ensureShareLinkIndexes } from './models/sharelink'
+import { ensureAuthTokenIndexes } from './models/authToken'
 
 const MONGO = process.env.MONGO_URI || 'mongodb://mongo:27017'
 const DBNAME = process.env.DB_NAME || 'excalidraw_slides'
 
 async function main() {
   const app = express()
-  app.use(bodyParser.json({limit: '10mb'}))
+  app.use(bodyParser.json({ limit: '10mb' }))
 
   const server = http.createServer(app)
-  const io = new IOServer(server, {cors: {origin: '*'}})
+  const io = new IOServer(server, { cors: { origin: '*' } })
 
   const client = new MongoClient(MONGO)
   await client.connect()
   const db = client.db(DBNAME)
 
-  app.get('/health', (_req, res) => res.json({ok: true}))
+  // Ensure all indexes
+  await Promise.all([
+    ensureUserIndexes(db),
+    ensureTeamIndexes(db),
+    ensurePresentationIndexes(db),
+    ensureSlideIndexes(db),
+    ensureVersionIndexes(db),
+    ensureSnapshotIndexes(db),
+    ensureShareLinkIndexes(db),
+    ensureAuthTokenIndexes(db),
+  ])
 
+  // ── Health ──────────────────────────────────────────────────────────────────
+  app.get('/health', (_req, res) => res.json({ ok: true }))
+
+  // ── Thumbnail storage (GridFS) ──────────────────────────────────────────────
   app.post('/thumbnail', async (req, res) => {
-    // expect { filename, data: base64 }
     try {
-      const { filename, data } = req.body
+      const { filename, data } = req.body as { filename?: string; data: string }
       const buf = Buffer.from(data.split(',').pop() || data, 'base64')
       const id = await storeThumbnail(db, buf, filename)
-      res.json({id})
+      res.json({ id })
     } catch (e) {
-      res.status(500).json({error: String(e)})
+      res.status(500).json({ error: String(e) })
     }
   })
 
   app.get('/thumbnail/:id', async (req, res) => {
-    const id = req.params.id
-    const stream = await getThumbnailStream(db, id)
+    const stream = await getThumbnailStream(db, req.params.id)
     if (!stream) return res.status(404).end()
+    res.setHeader('Content-Type', 'image/png')
     stream.pipe(res)
   })
 
-  io.on('connection', (socket) => {
-    socket.on('join', (room) => socket.join(room))
-    socket.on('cursor', (payload) => socket.to(payload.room).emit('cursor', payload))
-    socket.on('diff', (payload) => socket.to(payload.room).emit('diff', payload))
-  })
+  // ── API routers ─────────────────────────────────────────────────────────────
+  app.use('/auth', makeAuthRouter(db))
+  app.use('/teams', makeTeamsRouter(db))
+  app.use('/presentations', makePresentationsRouter(db))
 
+  // ── WebSocket ───────────────────────────────────────────────────────────────
+  attachWs(io, db)
+
+  // ── Background jobs ─────────────────────────────────────────────────────────
+  schedulePruneVersions(db)
+
+  // ── Start ───────────────────────────────────────────────────────────────────
   const port = process.env.PORT || 3000
-  server.listen(port, () => console.log('Server listening on', port))
+  server.listen(port, () => console.log(`Server listening on :${port}`))
 }
 
 main().catch((err) => {

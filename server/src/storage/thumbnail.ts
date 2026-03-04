@@ -4,10 +4,17 @@ export async function storeThumbnail(db: Db, buffer: Buffer, filename = 'thumb.p
   const bucket = new GridFSBucket(db, { bucketName: 'thumbnails' })
   return new Promise<string>((resolve, reject) => {
     const upload = bucket.openUploadStream(filename, { metadata: { createdAt: new Date() } })
-    upload.end(buffer, (err: Error | null, file) => {
-      if (err) return reject(err)
-      resolve(String(file._id))
+    // Listen to stream events instead of using end(...callback) which has
+    // a different callback signature in the GridFS types.
+    upload.on('error', (err: Error) => {
+      reject(err)
     })
+    upload.on('finish', () => {
+      // `upload.id` contains the file _id assigned by GridFS.
+      // The type may be ObjectId; coerce to string for storage.
+      resolve(String((upload as any).id))
+    })
+    upload.end(buffer)
   })
 }
 

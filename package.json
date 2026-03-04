@@ -11,6 +11,7 @@
     "test": "jest --runInBand"
   },
   "dependencies": {
+    "@excalidraw/excalidraw": "^0.17.0",
     "@preact/preset-vite": "^2.0.0",
     "bcryptjs": "^2.4.3",
     "body-parser": "^1.20.0",

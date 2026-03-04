@@ -1,60 +1,123 @@
-/**
- * PresenterView — full-featured slide presenter with:
- *  - Slide canvas area + prev/next navigation
- *  - Realtime cursors from peers (smoothed via RTCClient)
- *  - Thumbnail sidebar (images loaded via /thumbnail/:id)
- *  - History panel toggle
- *  - Export to PNG
- */
-
 import { h, Fragment } from 'preact'
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks'
+import { Excalidraw } from '@excalidraw/excalidraw'
+import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types'
 import { RTCClient, Peer, PresencePayload } from './rtc'
 import HistoryPanel from './history'
-import { exportElementToPNG, downloadPNG } from './export'
+import { exportSlideToPNG, downloadPNG } from './export'
+import { exportToCanvas } from '@excalidraw/excalidraw'
 
-type SlideData = {
-  _id: string
-  order: number
+// ── Types ──────────────────────────────────────────────────────────────────────
+
+type SlideState = {
+  /** nanoid-style local id (also used as DB _id when synced) */
+  id: string
+  elements: readonly any[]
+  appState: Record<string, any>
   notes: string
-  thumbnailId?: string
+  /** data-URL of 4:3 thumbnail generated on slide-leave */
+  thumb?: string
 }
 
 type Props = {
+  /** If omitted the app works fully in localStorage-only demo mode */
   presentationId?: string
   authToken?: string
   serverUrl?: string
 }
 
+const LS_KEY = 'excalidraw-slides-demo'
 const THROTTLE_MS = 50
 
+function newSlide(): SlideState {
+  return {
+    id: Math.random().toString(36).slice(2),
+    elements: [],
+    appState: {},
+    notes: '',
+  }
+}
+
+function loadLocal(): SlideState[] {
+  try {
+    const raw = localStorage.getItem(LS_KEY)
+    if (raw) return JSON.parse(raw) as SlideState[]
+  } catch { /* ignore */ }
+  return [newSlide()]
+}
+
+function saveLocal(slides: SlideState[]) {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(slides)) } catch { /* ignore */ }
+}
+
+// ── Thumbnail helper ──────────────────────────────────────────────────────────
+
+async function makeThumb(elements: readonly any[], appState: Record<string, any>): Promise<string | undefined> {
+  if (!elements.length) return undefined
+  try {
+    const canvas = await exportToCanvas({
+      elements: elements as any,
+      appState: { ...appState, exportWithDarkMode: false },
+      files: {},
+      getDimensions: () => ({ width: 320, height: 240, scale: 1 }),
+    })
+    return canvas.toDataURL('image/png')
+  } catch { return undefined }
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
 export default function PresenterView({ presentationId = '', authToken = '', serverUrl = '/' }: Props) {
+  const [slides, setSlides] = useState<SlideState[]>(loadLocal)
   const [currentIdx, setCurrentIdx] = useState(0)
-  const [slides, setSlides] = useState<SlideData[]>([])
   const [peers, setPeers] = useState<Peer[]>([])
   const [cursors, setCursors] = useState<Map<string, PresencePayload>>(new Map())
   const [showHistory, setShowHistory] = useState(false)
-  const canvasRef = useRef<HTMLDivElement>(null)
-  const rtcRef = useRef<RTCClient | null>(null)
-  const lastSentRef = useRef(0)
+  const [toast, setToast] = useState('')
+  const [isSwitching, setIsSwitching] = useState(false)
 
-  // ── Load slides ────────────────────────────────────────────────────────────
+  const excalidrawApiRef = useRef<ExcalidrawImperativeAPI | null>(null)
+  const rtcRef = useRef<RTCClient | null>(null)
+  const canvasAreaRef = useRef<HTMLDivElement>(null)
+  const lastSentRef = useRef(0)
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // ── Toast helper ─────────────────────────────────────────────────────────────
+  function showToast(msg: string) {
+    setToast(msg)
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(''), 2200)
+  }
+
+  // ── Persist local on every slide change ──────────────────────────────────────
+  useEffect(() => { saveLocal(slides) }, [slides])
+
+  // ── Load slides from API (when connected) ──────────────────────────────────
   useEffect(() => {
     if (!presentationId || !authToken) return
     fetch(`/presentations/${presentationId}/slides`, {
       headers: { Authorization: `Bearer ${authToken}` },
     })
       .then((r) => r.json())
-      .then((data: SlideData[]) => setSlides(data))
+      .then((data: any[]) => {
+        if (!Array.isArray(data) || !data.length) return
+        const loaded: SlideState[] = data.map((s) => ({
+          id: s._id,
+          elements: s.elements ?? [],
+          appState: s.appState ?? {},
+          notes: s.notes ?? '',
+        }))
+        setSlides(loaded)
+        setCurrentIdx(0)
+      })
       .catch(console.error)
   }, [presentationId, authToken])
 
-  // ── RTC setup ──────────────────────────────────────────────────────────────
+  // ── RTC ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!presentationId || !authToken) return
     const rtc = new RTCClient(serverUrl)
     rtcRef.current = rtc
-
     rtc.on('joined', ({ peers }) => setPeers(peers))
     rtc.on('peerJoined', (peer) => setPeers((ps) => [...ps, peer]))
     rtc.on('peerLeft', ({ socketId }) => {
@@ -62,187 +125,317 @@ export default function PresenterView({ presentationId = '', authToken = '', ser
       setCursors((c) => { const m = new Map(c); m.delete(socketId); return m })
     })
     rtc.on('presence', (p) => setCursors((c) => new Map(c).set(p.socketId, p)))
-    rtc.on('slideChange', ({ slideIndex }) => setCurrentIdx(slideIndex))
-
-    rtc.joinRoom(presentationId, { token: authToken }).catch(console.error)
-
+    rtc.on('diff', ({ slideId, patch }) => {
+      setSlides((prev) => prev.map((s) => s.id === slideId ? { ...s, elements: patch as any[] } : s))
+    })
+    rtc.on('slideChange', ({ slideIndex }) => switchTo(slideIndex, false))
+    rtc.joinRoom(presentationId, { token: authToken, name: 'Me' }).catch(console.error)
     return () => rtc.disconnect()
   }, [presentationId, authToken, serverUrl])
 
-  // ── Pointer tracking ───────────────────────────────────────────────────────
+  // ── Throttled pointer broadcast ───────────────────────────────────────────
   const handleMouseMove = useCallback((e: MouseEvent) => {
     const now = Date.now()
     if (now - lastSentRef.current < THROTTLE_MS) return
     lastSentRef.current = now
-    const rect = canvasRef.current?.getBoundingClientRect()
+    const rect = canvasAreaRef.current?.getBoundingClientRect()
     if (!rect) return
     const x = ((e.clientX - rect.left) / rect.width) * 100
     const y = ((e.clientY - rect.top) / rect.height) * 100
     rtcRef.current?.sendPresence(x, y)
   }, [])
 
-  // ── Navigation ─────────────────────────────────────────────────────────────
-  function goPrev() {
-    const idx = Math.max(0, currentIdx - 1)
+  // ── Save current slide state then switch ─────────────────────────────────────
+  async function switchTo(idx: number, broadcast = true) {
+    if (idx === currentIdx || isSwitching) return
+    setIsSwitching(true)
+
+    // Snapshot current slide state from Excalidraw API
+    const api = excalidrawApiRef.current
+    if (api) {
+      const elements = api.getSceneElements()
+      const appState = api.getAppState()
+      const thumb = await makeThumb(elements, appState)
+      setSlides((prev) =>
+        prev.map((s, i) => i === currentIdx ? { ...s, elements, appState, thumb } : s)
+      )
+    }
+
     setCurrentIdx(idx)
-    rtcRef.current?.sendSlideChange(idx)
+    if (broadcast) rtcRef.current?.sendSlideChange(idx)
+    setIsSwitching(false)
   }
 
-  function goNext() {
-    const idx = Math.min(slides.length - 1, currentIdx + 1)
-    setCurrentIdx(idx)
-    rtcRef.current?.sendSlideChange(idx)
+  // ── Load new slide into Excalidraw when currentIdx changes ───────────────────
+  useEffect(() => {
+    const api = excalidrawApiRef.current
+    const slide = slides[currentIdx]
+    if (!api || !slide) return
+    api.updateScene({
+      elements: slide.elements as any[],
+      appState: { ...slide.appState, collaborators: new Map() } as any,
+    })
+    api.scrollToContent(slide.elements as any[], { fitToContent: true })
+  }, [currentIdx]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Excalidraw onChange — broadcast diff, update local state ─────────────────
+  const handleChange = useCallback((elements: readonly any[], _appState: any) => {
+    const slide = slides[currentIdx]
+    if (!slide) return
+    // Update elements in slide array (debounced enough by Excalidraw itself)
+    setSlides((prev) => prev.map((s, i) => i === currentIdx ? { ...s, elements } : s))
+    // Broadcast diff
+    rtcRef.current?.sendDiff(slide.id, elements as any[])
+  }, [currentIdx, slides])
+
+  // ── Add slide ─────────────────────────────────────────────────────────────────
+  async function addSlide() {
+    // First persist current slide state
+    const api = excalidrawApiRef.current
+    let updated = slides
+    if (api) {
+      const elements = api.getSceneElements()
+      const appState = api.getAppState()
+      const thumb = await makeThumb(elements, appState)
+      updated = slides.map((s, i) => i === currentIdx ? { ...s, elements, appState, thumb } : s)
+    }
+    const fresh = newSlide()
+    const next = [...updated, fresh]
+    setSlides(next)
+    const newIdx = next.length - 1
+    setCurrentIdx(newIdx)
+
+    // When server-connected create the slide there too
+    if (presentationId && authToken) {
+      fetch(`/presentations/${presentationId}/slides`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ elements: [], appState: {}, notes: '' }),
+      }).catch(console.error)
+    }
   }
 
-  // ── Export ─────────────────────────────────────────────────────────────────
+  // ── Delete current slide ──────────────────────────────────────────────────────
+  async function deleteSlide() {
+    if (slides.length <= 1) { showToast('Cannot delete the last slide'); return }
+    if (!confirm(`Delete slide ${currentIdx + 1}?`)) return
+    const removed = slides[currentIdx]
+    const next = slides.filter((_, i) => i !== currentIdx)
+    const nextIdx = Math.min(currentIdx, next.length - 1)
+    setSlides(next)
+    setCurrentIdx(nextIdx)
+
+    if (presentationId && authToken && removed.id) {
+      fetch(`/presentations/${presentationId}/slides/${removed.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
+      }).catch(console.error)
+    }
+  }
+
+  // ── Export current slide as PNG ───────────────────────────────────────────────
   async function handleExport() {
-    if (!canvasRef.current) return
-    const blob = await exportElementToPNG(canvasRef.current, 2)
-    downloadPNG(blob, `slide-${currentIdx + 1}.png`)
+    const slide = slides[currentIdx]
+    if (!slide) return
+    const api = excalidrawApiRef.current
+    const elements = api ? api.getSceneElements() : slide.elements
+    const appState = api ? api.getAppState() : slide.appState
+    try {
+      const blob = await exportSlideToPNG({ elements, appState, files: {} })
+      downloadPNG(blob, `slide-${currentIdx + 1}.png`)
+      showToast('Exported!')
+    } catch (e) {
+      showToast('Export failed')
+    }
+  }
+
+  // ── Update notes for current slide ───────────────────────────────────────────
+  function handleNotesChange(val: string) {
+    setSlides((prev) => prev.map((s, i) => i === currentIdx ? { ...s, notes: val } : s))
   }
 
   const currentSlide = slides[currentIdx]
 
   return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
-      {/* Thumbnail sidebar */}
-      <nav
-        aria-label="Slide thumbnails"
-        style={{ width: '120px', overflowY: 'auto', borderRight: '1px solid #ddd', background: '#fafafa', padding: '8px' }}
-      >
-        {slides.map((s, i) => (
-          <button
-            key={s._id}
-            aria-label={`Go to slide ${i + 1}`}
-            aria-current={i === currentIdx ? 'true' : undefined}
-            onClick={() => { setCurrentIdx(i); rtcRef.current?.sendSlideChange(i) }}
-            style={{
-              display: 'block',
-              width: '100%',
-              marginBottom: '8px',
-              padding: '4px',
-              border: i === currentIdx ? '2px solid #007acc' : '2px solid transparent',
-              borderRadius: '4px',
-              cursor: 'pointer',
-              background: 'white',
-              textAlign: 'center',
-            }}
-          >
-            {s.thumbnailId ? (
-              <img
-                src={`/thumbnail/${s.thumbnailId}`}
-                alt={`Slide ${i + 1} thumbnail`}
-                style={{ width: '100%', height: '60px', objectFit: 'contain' }}
-              />
-            ) : (
-              <span style={{ fontSize: '11px', color: '#999' }}>Slide {i + 1}</span>
-            )}
-          </button>
-        ))}
-      </nav>
+    <div class="slides-app">
+      {/* ── Sidebar: slide thumbnails ── */}
+      <aside class="slides-sidebar">
+        <div class="sidebar-header">
+          <span class="sidebar-logo-icon">▶</span>
+          Slides
+        </div>
 
-      {/* Main canvas area */}
-      <section
-        aria-label="Slide canvas"
-        style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
-      >
+        <div class="slide-list" role="listbox" aria-label="Slides">
+          {slides.map((s, i) => (
+            <button
+              key={s.id}
+              role="option"
+              aria-selected={i === currentIdx}
+              aria-label={`Slide ${i + 1}`}
+              class={`slide-thumb-btn${i === currentIdx ? ' active' : ''}`}
+              onClick={() => switchTo(i)}
+            >
+              {s.thumb
+                ? <img src={s.thumb} alt={`Slide ${i + 1}`} />
+                : <div class="slide-thumb-placeholder">✦</div>
+              }
+              <span class="slide-thumb-num">{i + 1}</span>
+            </button>
+          ))}
+        </div>
+
+        <div class="sidebar-footer">
+          <button class="btn-add-slide" onClick={addSlide} aria-label="Add slide">
+            <span>+</span> Add slide
+          </button>
+        </div>
+      </aside>
+
+      {/* ── Main panel ── */}
+      <div class="slides-main">
         {/* Toolbar */}
-        <div
-          role="toolbar"
-          aria-label="Presentation controls"
-          style={{ display: 'flex', gap: '8px', padding: '8px', borderBottom: '1px solid #ddd', alignItems: 'center' }}
-        >
-          <button onClick={goPrev} aria-label="Previous slide" disabled={currentIdx === 0}>← Prev</button>
-          <span aria-live="polite">{currentIdx + 1} / {slides.length || 1}</span>
-          <button onClick={goNext} aria-label="Next slide" disabled={currentIdx >= slides.length - 1}>Next →</button>
-          <button onClick={handleExport} aria-label="Export slide to PNG">Export PNG</button>
+        <div class="slide-toolbar" role="toolbar" aria-label="Presentation controls">
           <button
+            class="icon-btn"
+            onClick={() => switchTo(Math.max(0, currentIdx - 1))}
+            disabled={currentIdx === 0}
+            aria-label="Previous slide"
+            title="Previous (←)"
+          >
+            ←
+          </button>
+          <span class="slide-counter" aria-live="polite">
+            {currentIdx + 1} / {slides.length}
+          </span>
+          <button
+            class="icon-btn"
+            onClick={() => switchTo(Math.min(slides.length - 1, currentIdx + 1))}
+            disabled={currentIdx >= slides.length - 1}
+            aria-label="Next slide"
+            title="Next (→)"
+          >
+            →
+          </button>
+
+          <span class="toolbar-divider" />
+
+          <button class="icon-btn" onClick={addSlide} aria-label="Add slide" title="Add slide">
+            + Slide
+          </button>
+          <button class="icon-btn danger" onClick={deleteSlide} aria-label="Delete slide" title="Delete current slide">
+            🗑
+          </button>
+
+          <span class="toolbar-divider" />
+
+          <button class="icon-btn" onClick={handleExport} aria-label="Export PNG" title="Export as PNG">
+            ↓ PNG
+          </button>
+
+          <span class="toolbar-spacer" />
+
+          {peers.length > 0 && (
+            <span class="peers-badge" aria-label={`${peers.length} peer(s) connected`}>
+              <span class="peer-dot" />
+              {peers.length} live
+            </span>
+          )}
+
+          <span class="toolbar-divider" />
+
+          <button
+            class={`icon-btn${showHistory ? ' primary' : ''}`}
             onClick={() => setShowHistory(!showHistory)}
-            aria-expanded={showHistory}
-            aria-label="Toggle history panel"
+            aria-pressed={showHistory}
+            aria-label="Toggle history"
+            title="History & snapshots"
           >
             History
           </button>
-          <span style={{ marginLeft: 'auto', fontSize: '12px', color: '#666' }}>
-            {peers.length} peer{peers.length !== 1 ? 's' : ''} connected
-          </span>
         </div>
 
-        {/* Canvas + peer cursors */}
+        {/* Canvas */}
         <div
-          ref={canvasRef}
+          class="canvas-area"
+          ref={canvasAreaRef}
           onMouseMove={handleMouseMove as any}
-          aria-label="Slide content"
-          style={{ flex: 1, position: 'relative', background: '#fff', overflow: 'hidden' }}
         >
-          <div style={{ padding: '40px', color: '#aaa', textAlign: 'center' }}>
-            {currentSlide ? (
-              <pre style={{ textAlign: 'left' }}>{JSON.stringify(currentSlide, null, 2)}</pre>
-            ) : (
-              <p>No slides loaded — create one via the API.</p>
-            )}
-          </div>
+          {!isSwitching && (
+            <Excalidraw
+              excalidrawAPI={(api: ExcalidrawImperativeAPI) => { excalidrawApiRef.current = api }}
+              initialData={{
+                elements: (currentSlide?.elements ?? []) as any[],
+                appState: { ...currentSlide?.appState, collaborators: new Map() } as any,
+              }}
+              onChange={handleChange}
+              UIOptions={{
+                canvasActions: {
+                  saveToActiveFile: false,
+                  loadScene: false,
+                  saveAsImage: false,
+                  export: false,
+                },
+              }}
+            />
+          )}
 
           {/* Peer cursors overlay */}
           {Array.from(cursors.values()).map((c) => (
             <div
               key={c.socketId}
-              role="img"
-              aria-label={`${c.name}'s cursor`}
-              style={{
-                position: 'absolute',
-                left: `${c.x}%`,
-                top: `${c.y}%`,
-                pointerEvents: 'none',
-                transform: 'translate(-50%, -50%)',
-              }}
+              class="peer-cursor"
+              style={{ left: `${c.x}%`, top: `${c.y}%`, '--cursor-color': c.color } as any}
+              aria-hidden="true"
             >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill={c.color}>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill={c.color} xmlns="http://www.w3.org/2000/svg">
                 <path d="M0 0 L16 6 L8 8 L6 16 Z" />
               </svg>
-              <span
-                style={{
-                  background: c.color,
-                  color: '#fff',
-                  borderRadius: '4px',
-                  padding: '2px 4px',
-                  fontSize: '10px',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {c.name}
-              </span>
+              <span class="peer-cursor-label">{c.name}</span>
             </div>
           ))}
         </div>
 
-        {/* Speaker notes */}
-        {currentSlide?.notes && (
-          <footer
+        {/* Notes bar */}
+        <div class="notes-bar">
+          <span class="notes-label">Notes</span>
+          <textarea
+            class="notes-input"
+            placeholder="Speaker notes for this slide…"
+            value={currentSlide?.notes ?? ''}
+            onInput={(e) => handleNotesChange((e.target as HTMLTextAreaElement).value)}
             aria-label="Speaker notes"
-            style={{ padding: '8px', borderTop: '1px solid #ddd', fontSize: '13px', maxHeight: '100px', overflowY: 'auto' }}
-          >
-            <strong>Notes:</strong> {currentSlide.notes}
-          </footer>
-        )}
-      </section>
+          />
+        </div>
+      </div>
 
       {/* History panel */}
-      {showHistory && presentationId && authToken && (
+      {showHistory && (
         <HistoryPanel
           presentationId={presentationId}
           authToken={authToken}
+          onClose={() => setShowHistory(false)}
+          // ↑ prop exists — lang-server may need reload
           onRestored={() => {
             setShowHistory(false)
+            if (!presentationId || !authToken) return
             fetch(`/presentations/${presentationId}/slides`, {
               headers: { Authorization: `Bearer ${authToken}` },
             })
               .then((r) => r.json())
-              .then((data: SlideData[]) => { setSlides(data); setCurrentIdx(0) })
+              .then((data: any[]) => {
+                const loaded: SlideState[] = data.map((s) => ({
+                  id: s._id, elements: s.elements ?? [], appState: s.appState ?? {}, notes: s.notes ?? '',
+                }))
+                setSlides(loaded)
+                setCurrentIdx(0)
+              })
               .catch(console.error)
           }}
         />
       )}
+
+      {/* Toast */}
+      {toast && <div class="toast" role="status" aria-live="polite">{toast}</div>}
     </div>
   )
 }

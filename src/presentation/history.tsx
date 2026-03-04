@@ -31,6 +31,7 @@ type Props = {
   presentationId: string
   authToken: string
   onRestored?: () => void
+  onClose?: () => void
 }
 
 async function apiFetch<T>(url: string, token: string, opts?: RequestInit): Promise<T> {
@@ -42,7 +43,7 @@ async function apiFetch<T>(url: string, token: string, opts?: RequestInit): Prom
   return res.json() as Promise<T>
 }
 
-export default function HistoryPanel({ presentationId, authToken, onRestored }: Props) {
+export default function HistoryPanel({ presentationId, authToken, onRestored, onClose }: Props) {
   const [versions, setVersions] = useState<VersionEntry[]>([])
   const [snapshots, setSnapshots] = useState<SnapshotEntry[]>([])
   const [newSnapshotName, setNewSnapshotName] = useState('')
@@ -50,6 +51,7 @@ export default function HistoryPanel({ presentationId, authToken, onRestored }: 
   const [status, setStatus] = useState('')
 
   async function load() {
+    if (!presentationId || !authToken) return
     setLoading(true)
     try {
       const [v, s] = await Promise.all([
@@ -58,7 +60,7 @@ export default function HistoryPanel({ presentationId, authToken, onRestored }: 
       ])
       setVersions(v)
       setSnapshots(s)
-    } catch (e) {
+    } catch {
       setStatus('Failed to load history')
     } finally {
       setLoading(false)
@@ -98,58 +100,76 @@ export default function HistoryPanel({ presentationId, authToken, onRestored }: 
   }
 
   return (
-    <aside aria-label="Version history" style={{ width: '280px', padding: '12px', borderLeft: '1px solid #ddd', overflowY: 'auto' }}>
-      <h3>History</h3>
-
-      {/* Create snapshot */}
-      <div style={{ display: 'flex', gap: '6px', marginBottom: '12px' }}>
-        <input
-          type="text"
-          aria-label="Snapshot name"
-          placeholder="Snapshot name…"
-          value={newSnapshotName}
-          onInput={(e) => setNewSnapshotName((e.target as HTMLInputElement).value)}
-          style={{ flex: 1, padding: '4px' }}
-        />
-        <button onClick={createSnapshot} disabled={!newSnapshotName.trim()}>Save</button>
+    <aside class="history-panel" aria-label="Version history">
+      <div class="history-panel-header">
+        <span>History</span>
+        {onClose && (
+          <button class="icon-btn" onClick={onClose} aria-label="Close history panel">✕</button>
+        )}
       </div>
-      {status && <p aria-live="polite" style={{ color: 'green', margin: 0 }}>{status}</p>}
 
-      {/* Named snapshots */}
-      <section aria-label="Named snapshots">
-        <h4 style={{ marginBottom: '4px' }}>Snapshots</h4>
-        {snapshots.length === 0 && !loading && <p style={{ color: '#999', fontSize: '12px' }}>No snapshots yet.</p>}
-        <ul style={{ listStyle: 'none', padding: 0 }}>
+      <div class="history-panel-body">
+        {/* Snapshot create */}
+        {presentationId && authToken ? (
+          <section>
+            <p class="history-section-title">Save snapshot</p>
+            <div class="snap-create-row">
+              <input
+                class="snap-input"
+                type="text"
+                aria-label="Snapshot name"
+                placeholder="Name…"
+                value={newSnapshotName}
+                onInput={(e) => setNewSnapshotName((e.target as HTMLInputElement).value)}
+                onKeyDown={(e) => e.key === 'Enter' && createSnapshot()}
+              />
+              <button class="icon-btn primary" onClick={createSnapshot} disabled={!newSnapshotName.trim()}>
+                Save
+              </button>
+            </div>
+            {status && <p aria-live="polite" style={{ color: 'var(--color-primary)', fontSize: '11px' }}>{status}</p>}
+          </section>
+        ) : (
+          <p style={{ fontSize: '11px', color: 'var(--color-muted)' }}>
+            Connect to a server to save named snapshots.
+          </p>
+        )}
+
+        {/* Named snapshots */}
+        <section>
+          <p class="history-section-title">Snapshots</p>
+          {loading && <p style={{ fontSize: '11px', color: 'var(--color-muted)' }}>Loading…</p>}
+          {!loading && snapshots.length === 0 && (
+            <p style={{ fontSize: '11px', color: 'var(--color-muted)' }}>No snapshots yet.</p>
+          )}
           {snapshots.map((s) => (
-            <li key={s._id} style={{ marginBottom: '8px', padding: '6px', background: '#f9f9f9', borderRadius: '4px' }}>
-              <strong>{s.name}</strong>
-              <br />
-              <small>{new Date(s.createdAt).toLocaleString()}</small>
-              <br />
+            <div key={s._id} class="snap-item">
+              <span class="snap-item-name">{s.name}</span>
+              <span class="snap-item-date">{new Date(s.createdAt).toLocaleString()}</span>
               <button
-                style={{ marginTop: '4px', fontSize: '11px' }}
+                class="icon-btn snap-restore"
                 onClick={() => restoreSnapshot(s._id)}
                 aria-label={`Restore snapshot ${s.name}`}
               >
-                Restore
+                ↩ Restore
               </button>
-            </li>
+            </div>
           ))}
-        </ul>
-      </section>
+        </section>
 
-      {/* Auto-history */}
-      <section aria-label="Auto history">
-        <h4 style={{ marginBottom: '4px' }}>Auto-history (last {versions.length})</h4>
-        {loading && <p>Loading…</p>}
-        <ul style={{ listStyle: 'none', padding: 0 }}>
+        {/* Auto-history */}
+        <section>
+          <p class="history-section-title">Auto-history ({versions.length})</p>
+          {versions.length === 0 && !loading && (
+            <p style={{ fontSize: '11px', color: 'var(--color-muted)' }}>No auto-history yet.</p>
+          )}
           {versions.map((v) => (
-            <li key={v._id} style={{ marginBottom: '4px', fontSize: '12px', color: '#555' }}>
-              Slide {v.slideId.slice(-6)} — {new Date(v.createdAt).toLocaleTimeString()}
-            </li>
+            <div key={v._id} style={{ fontSize: '11px', color: 'var(--color-muted)', padding: '3px 0', borderBottom: '1px solid var(--color-border)' }}>
+              Slide …{v.slideId.slice(-5)} — {new Date(v.createdAt).toLocaleTimeString()}
+            </div>
           ))}
-        </ul>
-      </section>
+        </section>
+      </div>
     </aside>
   )
 }

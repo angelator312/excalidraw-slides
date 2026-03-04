@@ -103,8 +103,7 @@ async function makeThumb(elements: readonly any[], appState: Record<string, any>
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function PresenterView({ presentationId = '', authToken = '', serverUrl = '/' }: Props) {
-  // Diagnostic: component mounted
-  console.log('[client] PresenterView mount', { presentationId: !!presentationId, serverUrl, pid: process?.pid || null })
+  /* mount log moved to a useEffect so it runs once (prevents spamming on each render) */
 
   const [slides, setSlides] = useState<SlideState[]>(loadLocal)
   const [currentIdx, setCurrentIdx] = useState(0)
@@ -119,6 +118,11 @@ export default function PresenterView({ presentationId = '', authToken = '', ser
   const canvasAreaRef = useRef<HTMLDivElement>(null)
   const lastSentRef = useRef(0)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    // Run once on mount to log diagnostic information without spamming on every render
+    console.log('[client] PresenterView mount', { presentationId: !!presentationId, serverUrl, pid: process?.pid || null })
+  }, [])
 
   // ── Toast helper ─────────────────────────────────────────────────────────────
   function showToast(msg: string) {

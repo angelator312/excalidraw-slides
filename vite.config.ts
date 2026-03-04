@@ -3,6 +3,10 @@ import preact from '@preact/preset-vite'
 
 export default defineConfig({
   plugins: [preact()],
+  define: {
+    'process.env.IS_PREACT': JSON.stringify('true'),
+    'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development'),
+  },
   server: {
     port: 5173,
     proxy: {

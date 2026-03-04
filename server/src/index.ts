@@ -14,6 +14,18 @@ import { schedulePruneVersions } from './jobs/pruneVersions'
 import {
   ensureUserIndexes,
 } from './models/user'
+
+/* Diagnostic logger helpers --------------------------------------------------*/
+function logReq(req: any) {
+  // lightweight single-line request logging to diagnose high CPU / hung requests
+  console.log(`[req] ${req.method} ${req.url} - pid:${process.pid}`)
+}
+function logInfo(...args: any[]) {
+  console.log('[info]', ...args)
+}
+function logError(...args: any[]) {
+  console.error('[error]', ...args)
+}
 import { ensureTeamIndexes } from './models/team'
 import { ensurePresentationIndexes } from './models/presentation'
 import { ensureSlideIndexes } from './models/slide'
@@ -27,6 +39,13 @@ const DBNAME = process.env.DB_NAME || 'excalidraw_slides'
 
 async function main() {
   const app = express()
+
+  // Simple request logger for diagnostics (keeps output minimal)
+  app.use((req, _res, next) => {
+    try { logReq(req) } catch (e) { /* ignore logging errors */ }
+    next()
+  })
+
   app.use(bodyParser.json({ limit: '10mb' }))
 
   const server = http.createServer(app)
@@ -81,12 +100,31 @@ async function main() {
   // ── Background jobs ─────────────────────────────────────────────────────────
   schedulePruneVersions(db)
 
+  // Express error handler (must be registered after all routers/middleware)
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    logError('[express][error]', err)
+    try {
+      res.status(500).json({ error: String(err) })
+    } catch {
+      // best-effort logging; nothing more we can do if response fails
+    }
+  })
+
+  // Process-level handlers to surface uncaught issues during development
+  process.on('uncaughtException', (err) => {
+    logError('[process][uncaughtException]', err)
+  })
+  process.on('unhandledRejection', (reason) => {
+    logError('[process][unhandledRejection]', reason)
+  })
+
   // ── Start ───────────────────────────────────────────────────────────────────
   const port = process.env.PORT || 3000
-  server.listen(port, () => console.log(`Server listening on :${port}`))
+  server.listen(port, () => logInfo(`Server listening on :${port} (pid:${process.pid})`))
 }
 
 main().catch((err) => {
-  console.error(err)
+  logError(err)
+  // exit to make failures visible in CI / dev environment
   process.exit(1)
 })

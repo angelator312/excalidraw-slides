@@ -41,13 +41,48 @@ function newSlide(): SlideState {
 function loadLocal(): SlideState[] {
   try {
     const raw = localStorage.getItem(LS_KEY)
-    if (raw) return JSON.parse(raw) as SlideState[]
-  } catch { /* ignore */ }
+    if (!raw) return [newSlide()]
+
+    // Guard against huge/malformed payloads that can block the main thread:
+    // - refuse payloads that are unreasonably large
+    // - ensure parsed value is an array and cap its length
+    if (raw.length > 200_000) {
+      console.warn('[client] loadLocal: stored data too large, ignoring')
+      return [newSlide()]
+    }
+
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) {
+      console.warn('[client] loadLocal: stored data not an array, ignoring')
+      return [newSlide()]
+    }
+
+    // Limit slides count to a safe upper bound to avoid huge in-memory arrays
+    const safe = (parsed as SlideState[]).slice(0, 200)
+    return safe.length ? safe : [newSlide()]
+  } catch (e) {
+    console.error('[client] loadLocal parse error', e)
+  }
   return [newSlide()]
 }
 
+let __saveLocalTimer: ReturnType<typeof setTimeout> | null = null
 function saveLocal(slides: SlideState[]) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(slides)) } catch { /* ignore */ }
+  try {
+    // Debounce writes to avoid frequent JSON serialization on the main thread.
+    if (__saveLocalTimer) clearTimeout(__saveLocalTimer)
+    __saveLocalTimer = setTimeout(() => {
+      try {
+        localStorage.setItem(LS_KEY, JSON.stringify(slides))
+      } catch (e) {
+        console.error('[client] saveLocal error', e)
+      } finally {
+        __saveLocalTimer = null
+      }
+    }, 150)
+  } catch (e) {
+    console.error('[client] saveLocal scheduling error', e)
+  }
 }
 
 // ── Thumbnail helper ──────────────────────────────────────────────────────────
@@ -68,6 +103,9 @@ async function makeThumb(elements: readonly any[], appState: Record<string, any>
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function PresenterView({ presentationId = '', authToken = '', serverUrl = '/' }: Props) {
+  // Diagnostic: component mounted
+  console.log('[client] PresenterView mount', { presentationId: !!presentationId, serverUrl, pid: process?.pid || null })
+
   const [slides, setSlides] = useState<SlideState[]>(loadLocal)
   const [currentIdx, setCurrentIdx] = useState(0)
   const [peers, setPeers] = useState<Peer[]>([])
@@ -95,11 +133,16 @@ export default function PresenterView({ presentationId = '', authToken = '', ser
   // ── Load slides from API (when connected) ──────────────────────────────────
   useEffect(() => {
     if (!presentationId || !authToken) return
+    console.log('[client] fetching slides', { presentationId })
     fetch(`/presentations/${presentationId}/slides`, {
       headers: { Authorization: `Bearer ${authToken}` },
     })
-      .then((r) => r.json())
+      .then((r) => {
+        console.log('[client] slides fetch status', r.status)
+        return r.json()
+      })
       .then((data: any[]) => {
+        console.log('[client] slides fetched', { presentationId, count: Array.isArray(data) ? data.length : 0 })
         if (!Array.isArray(data) || !data.length) return
         const loaded: SlideState[] = data.map((s) => ({
           id: s._id,
@@ -110,27 +153,53 @@ export default function PresenterView({ presentationId = '', authToken = '', ser
         setSlides(loaded)
         setCurrentIdx(0)
       })
-      .catch(console.error)
+      .catch((err) => {
+        console.error('[client] slides fetch error', err)
+      })
   }, [presentationId, authToken])
 
   // ── RTC ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!presentationId || !authToken) return
+    console.log('[client][rtc] init', { presentationId, serverUrl })
     const rtc = new RTCClient(serverUrl)
     rtcRef.current = rtc
-    rtc.on('joined', ({ peers }) => setPeers(peers))
-    rtc.on('peerJoined', (peer) => setPeers((ps) => [...ps, peer]))
+
+    rtc.on('joined', ({ peers }) => {
+      console.log('[client][rtc] joined', { peersCount: peers.length })
+      setPeers(peers)
+    })
+    rtc.on('peerJoined', (peer) => {
+      console.log('[client][rtc] peerJoined', peer)
+      setPeers((ps) => [...ps, peer])
+    })
     rtc.on('peerLeft', ({ socketId }) => {
+      console.log('[client][rtc] peerLeft', socketId)
       setPeers((ps) => ps.filter((p) => p.socketId !== socketId))
       setCursors((c) => { const m = new Map(c); m.delete(socketId); return m })
     })
-    rtc.on('presence', (p) => setCursors((c) => new Map(c).set(p.socketId, p)))
+    rtc.on('presence', (p) => {
+      // small debug: show presence events in console
+      // Do not spam when high-frequency; only log occasional samples
+      if (Math.random() < 0.02) console.log('[client][rtc] presence sample', p)
+      setCursors((c) => new Map(c).set(p.socketId, p))
+    })
     rtc.on('diff', ({ slideId, patch }) => {
+      console.log('[client][rtc] diff', { slideId, patchLen: Array.isArray(patch) ? patch.length : 'unknown' })
       setSlides((prev) => prev.map((s) => s.id === slideId ? { ...s, elements: patch as any[] } : s))
     })
-    rtc.on('slideChange', ({ slideIndex }) => switchTo(slideIndex, false))
-    rtc.joinRoom(presentationId, { token: authToken, name: 'Me' }).catch(console.error)
-    return () => rtc.disconnect()
+    rtc.on('slideChange', ({ slideIndex }) => {
+      console.log('[client][rtc] slideChange', slideIndex)
+      switchTo(slideIndex, false)
+    })
+
+    rtc.joinRoom(presentationId, { token: authToken, name: 'Me' })
+      .then(() => console.log('[client][rtc] joinRoom resolved'))
+      .catch((err) => console.error('[client][rtc] joinRoom error', err))
+
+    return () => {
+      try { rtc.disconnect() } catch (e) { console.error('[client][rtc] disconnect err', e) }
+    }
   }, [presentationId, authToken, serverUrl])
 
   // ── Throttled pointer broadcast ───────────────────────────────────────────

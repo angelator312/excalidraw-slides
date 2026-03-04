@@ -88,16 +88,12 @@ function saveLocal(slides: SlideState[]) {
 // ── Thumbnail helper ──────────────────────────────────────────────────────────
 
 async function makeThumb(elements: readonly any[], appState: Record<string, any>): Promise<string | undefined> {
-  if (!elements.length) return undefined
-  try {
-    const canvas = await exportToCanvas({
-      elements: elements as any,
-      appState: { ...appState, exportWithDarkMode: false },
-      files: {},
-      getDimensions: () => ({ width: 320, height: 240, scale: 1 }),
-    })
-    return canvas.toDataURL('image/png')
-  } catch { return undefined }
+  // Disabled: generating thumbnails with exportToCanvas is CPU-intensive and
+  // can block the main thread. Return quickly during debugging. If you want
+  // thumbnails re-enabled later, generate them off the main thread or remove
+  // this short-circuit.
+  console.debug('[client][thumb] generation disabled for responsiveness')
+  return undefined
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -117,6 +113,12 @@ export default function PresenterView({ presentationId = '', authToken = '', ser
   const rtcRef = useRef<RTCClient | null>(null)
   const canvasAreaRef = useRef<HTMLDivElement>(null)
   const lastSentRef = useRef(0)
+  // Throttle timestamp for sending diffs to the server (in ms)
+  const lastDiffSentRef = useRef<number>(0)
+  // Keep latest incoming elements to debounce UI updates and avoid frequent re-renders
+  const latestElementsRef = useRef<readonly any[] | null>(null)
+  const setSlidesTimerRef = useRef<number | null>(null)
+  const SLIDES_UPDATE_DEBOUNCE = 150
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
@@ -255,11 +257,28 @@ export default function PresenterView({ presentationId = '', authToken = '', ser
   const handleChange = useCallback((elements: readonly any[], _appState: any) => {
     const slide = slides[currentIdx]
     if (!slide) return
-    // Update elements in slide array (debounced enough by Excalidraw itself)
-    setSlides((prev) => prev.map((s, i) => i === currentIdx ? { ...s, elements } : s))
-    // Broadcast diff
-    rtcRef.current?.sendDiff(slide.id, elements as any[])
-  }, [currentIdx, slides])
+    // Keep latest elements in a ref and debounce UI updates to avoid frequent re-renders
+    latestElementsRef.current = elements
+    if (setSlidesTimerRef.current) {
+      clearTimeout(setSlidesTimerRef.current)
+    }
+    setSlidesTimerRef.current = window.setTimeout(() => {
+      const latest = latestElementsRef.current ?? elements
+      setSlides((prev) => prev.map((s, i) => i === currentIdx ? { ...s, elements: latest } : s))
+      setSlidesTimerRef.current = null
+    }, SLIDES_UPDATE_DEBOUNCE)
+
+    // Throttle broadcast diffs to avoid tight update loop (max once per 200ms)
+    try {
+      const now = Date.now()
+      if (now - lastDiffSentRef.current > 200) {
+        lastDiffSentRef.current = now
+        rtcRef.current?.sendDiff(slide.id, elements as any[])
+      }
+    } catch (e) {
+      console.error('[client][rtc] sendDiff err', e)
+    }
+  }, [currentIdx])
 
   // ── Add slide ─────────────────────────────────────────────────────────────────
   async function addSlide() {
